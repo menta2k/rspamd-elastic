@@ -155,26 +155,84 @@ local function elastic_collect(task)
 end
 local opts = rspamd_config:get_all_opt('elastic')
 local enabled = true;
-if opts then
-    for k,v in pairs(opts) do
-      settings[k] = v
+
+local function check_elastic_server(ev_base)
+  local function http_callback(err, code, body, headers)
+    local parser = ucl.parser()
+    local res,err = parser:parse_string(body)
+    if not res then
+        rspamd_logger.infox(rspamd_config, 'failed to query elasticsearch server %1, disabling module',settings['server'])
+        enabled = false;
+        return
     end
-    if not settings['server'] then
-      rspamd_logger.infox(rspamd_config, 'no elastic servers are specified, disabling module')
-      enabled = false
-    end
-    if not settings['mapping_file'] then
-        rspamd_logger.infox(rspamd_config, 'elastic mapping_file is required, disabling module')
+    local obj = parser:get_object()
+    for node,value in pairs(obj['nodes']) do
+      local plugin_found = false
+      for i,plugin in pairs(value['plugins']) do
+        if plugin['name'] == 'ingest-geoip' then
+          plugin_found = true
+        end
+      end
+      if not plugin_found then
+        rspamd_logger.infox(rspamd_config, 'Unable to find ingest-geoip on %1 node, disabling module',node)
         enabled = false
+        return
+      end
     end
+  end
+  rspamd_http.request({
+    url = 'http://'..settings['server']..'/_nodes/plugins',
+    ev_base = ev_base,
+    method = 'get',
+    callback = http_callback
+  })
+  if enabled then
+    local function http_ingest_callback(err, code, body, headers)
+      if code ~= 200 or err_message then
+        -- pipeline not exist
+      end
+    end
+    rspamd_http.request({
+      url = 'http://'..settings['server']..'/_ingest/pipeline/rspamd-geoip',
+      ev_base = ev_base,
+      method = 'get',
+      callback = http_ingest_callback
+    })
+    -- lets try to create ingest pipeline if not exist
+    rspamd_http.request({
+      url = 'http://'..settings['server']..'/_ingest/pipeline/rspamd-geoip',
+      task = task,
+      body = '{"description" : "Add geoip info for rspamd","processors" : [{"geoip" : {"field" : "rspam_meta.ip","target_field": "rspam_meta.geoip"}}]}',
+      method = 'put',
+    })
+  end
 end
-json_mappings = read_file(settings['mapping_file']);
-if not json_mappings then
-      rspamd_logger.infox(rspamd_config, 'elastic unable to read mappings, disabling module')
-      enabled = false
-end
+rspamd_config:add_on_load(function(cfg, ev_base)
+  if opts then
+      for k,v in pairs(opts) do
+        settings[k] = v
+      end
+      if not settings['server'] then
+        rspamd_logger.infox(rspamd_config, 'no elastic servers are specified, disabling module')
+        enabled = false
+        return
+      end
+      if not settings['mapping_file'] then
+          rspamd_logger.infox(rspamd_config, 'elastic mapping_file is required, disabling module')
+          enabled = false
+          return
+      end
+  end
+  json_mappings = read_file(settings['mapping_file']);
+  if not json_mappings then
+        rspamd_logger.infox(rspamd_config, 'elastic unable to read mappings, disabling module')
+        enabled = false
+        return
+  end
+  check_elastic_server(ev_base)
+end)
+
 if enabled == true then
-  rspamd_logger.infox(rspamd_config, 'starting elastic module')
   current_index = os.date(settings['index_pattern'])
   rspamd_config:register_symbol({
     name = 'ELASTIC_COLLECT',
