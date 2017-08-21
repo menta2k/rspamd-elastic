@@ -20,10 +20,12 @@ local settings = {
   index_pattern = 'rspamd-%Y.%m.%d',
   server = 'localhost:9200',
   mapping_file = '/etc/rspamd/rspamd_template.json',
+  kibana_file = '/etc/rspamd/kibana.json',
   key_prefix = 'elastic-',
   expire = 3600,
   debug = false,
   failover = false,
+  import_kibana = false,
 }
 
 local function read_file(path)
@@ -229,7 +231,7 @@ local function check_elastic_server(ev_base)
     callback = http_template_exist_callback
   })
 end
-rspamd_config:add_on_load(function(cfg, ev_base)
+rspamd_config:add_on_load(function(cfg, ev_base,worker)
   if opts then
       for k,v in pairs(opts) do
         settings[k] = v
@@ -252,7 +254,33 @@ rspamd_config:add_on_load(function(cfg, ev_base)
         return
   end
   redis_params = rspamd_parse_redis_server('elastic')
+  if not (worker:get_name() == 'normal' and worker:get_index() == 0) then return end
   check_elastic_server(ev_base)
+  if enabled and settings['import_kibana'] then
+      local kibana_mappings = read_file(settings['kibana_file']);
+      if kibana_mappings then
+        local parser = ucl.parser()
+        local res,err = parser:parse_string(kibana_mappings)
+        if not res then
+          return
+        end
+        local obj = parser:get_object()
+        local bulk_json = ""
+        for _,item in ipairs(obj) do
+          bulk_json = bulk_json..'{ "index" : { "_index" : ".kibana", "_type" : "'..item["_type"]..'" ,"_id": "'..item["_id"]..'"} }'.."\n"
+          bulk_json = bulk_json..ucl.to_format(item['_source'], 'json-compact').."\n"
+        end
+        rspamd_http.request({
+          url = 'http://'..settings['server']..'/.kibana/_bulk',
+          headers = {
+            ['Content-Type'] = 'application/x-ndjson',
+          },
+          body = bulk_json,
+          task = task,
+          method = 'post'
+        })
+      end
+  end
 end)
 
 if enabled == true then
