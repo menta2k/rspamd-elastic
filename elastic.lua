@@ -2,21 +2,30 @@ local rspamd_logger = require 'rspamd_logger'
 local rspamd_http = require "rspamd_http"
 local rspamd_lua_utils = require "lua_util"
 local ucl = require "ucl"
+local hash = require "rspamd_cryptobox_hash"
 
 if confighelp then
   return
 end
+
+local redis_params
+redis_params = rspamd_parse_redis_server('elastic')
+
 local rows = {}
 local nrows = 0
 local json_mappings
+local redis_params
 local settings = {
   limit = 10,
   index_pattern = 'rspamd-%Y.%m.%d',
   server = 'localhost:9200',
   mapping_file = '/etc/rspamd/rspamd_template.json',
+  key_prefix = 'elastic-',
+  expire = 3600,
   debug = false,
+  failover = false,
 }
-local current_index
+
 local function read_file(path)
     local file = io.open(path, "rb")
     if not file then return nil end
@@ -24,47 +33,38 @@ local function read_file(path)
     file:close()
     return content
 end
-local function create_index(task,name)
-  local function http_index_create_callback(err, code, body, headers)
-    -- todo error handling disable the module maybe ? or run periodic task to retry index creation
-    if settings['debug'] then
-      rspamd_logger.infox(task, "After create index %1",body)
-    end
-  end
-  rspamd_http.request({
-    url = 'http://'..settings['server']..'/'..name,
-    task = task,
-    body = json_mappings,
-    method = 'put',
-    callback = http_index_create_callback
-  })
-end
 local function elastic_send_data(task)
-  local function http_index_exist_callback(err, code, body, headers)
-    if code ~= 200 or err_message then
-      create_index(task,current_index)
-    end
-  end
   local es_index = os.date(settings['index_pattern'])
-  if es_index ~= current_index then
-    create_index(task,es_index)
-    current_index = es_index
-  end
-  rspamd_http.request({
-    url = 'http://'..settings['server']..'/'..current_index,
-    task = task,
-    method = 'head',
-    callback = http_index_exist_callback
-  })
   local bulk_json = ""
   for key,value in pairs(rows) do
-    bulk_json= bulk_json..'{ "index" : { "_index" : "'..es_index..'", "_type" : "logs" ,"pipeline": "rspamd-geoip"} }'.."\n"
-    bulk_json= bulk_json..ucl.to_format(value, 'json-compact').."\n"
+    bulk_json = bulk_json..'{ "index" : { "_index" : "'..es_index..'", "_type" : "logs" ,"pipeline": "rspamd-geoip"} }'.."\n"
+    bulk_json = bulk_json..ucl.to_format(value, 'json-compact').."\n"
   end
   local function http_index_data_callback(err, code, body, headers)
     -- todo error handling we may store the rows it into redis and send it again later
     if settings['debug'] then
       rspamd_logger.infox(task, "After create data %1",body)
+    end
+    if code ~= 200 or err_message then
+      if settings['failover'] then
+        local h = hash.create()
+        h:update(bulk_json)
+        local key = settings['key_prefix'] ..es_index..":".. h:base32():sub(1, 20)
+        local data = rspamd_util.zstd_compress(bulk_json)
+        local function redis_set_cb(err)
+          if err ~=nil then
+            rspamd_logger.errx(task, 'redis_set_cb received error: %1', err)
+          end
+        end
+        rspamd_redis_make_request(task,
+          redis_params, -- connect params
+          key, -- hash key
+          true, -- is write
+          redis_set_cb, --callback
+          'SETEX', -- command
+          {key, tostring(settings['expire']), data} -- arguments
+        )
+      end
     end
   end
   rspamd_http.request({
@@ -206,6 +206,25 @@ local function check_elastic_server(ev_base)
       method = 'put',
     })
   end
+  local function http_template_create_callback(err, code, body, headers)
+  end
+  local function http_template_exist_callback(err, code, body, headers)
+    if code ~= 200 or err_message then
+      rspamd_http.request({
+        url = 'http://'..settings['server']..'/_template/rspamd',
+        task = task,
+        body = json_mappings,
+        method = 'put',
+        callback = http_template_create_callback
+      })
+    end
+  end
+  rspamd_http.request({
+    url = 'http://'..settings['server']..'/_template/rspamd',
+    task = task,
+    method = 'head',
+    callback = http_template_exist_callback
+  })
 end
 rspamd_config:add_on_load(function(cfg, ev_base)
   if opts then
@@ -229,11 +248,11 @@ rspamd_config:add_on_load(function(cfg, ev_base)
         enabled = false
         return
   end
+  redis_params = rspamd_parse_redis_server('elastic')
   check_elastic_server(ev_base)
 end)
 
 if enabled == true then
-  current_index = os.date(settings['index_pattern'])
   rspamd_config:register_symbol({
     name = 'ELASTIC_COLLECT',
     type = 'postfilter',
