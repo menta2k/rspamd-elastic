@@ -96,7 +96,7 @@ local function get_general_metadata(task)
   r.user = task:get_user() or 'unknown'
   r.qid = task:get_queue_id() or 'unknown'
   r.action = task:get_metric_action('default')
-  if r.user != 'unknown' then
+  if r.user ~= 'unknown' then
       r.direction = "Outbound"
   end
   local s = task:get_metric_score('default')[1]
@@ -147,7 +147,7 @@ end
 
 local function elastic_collect(task)
   if rspamd_lua_utils.is_rspamc_or_controller(task) then return end
-  local row = {['rspam_meta'] = get_general_metadata(task), ['@timestamp'] = os.date('%Y-%m-%dT%H:%M:%SZ')}
+  local row = {['rspam_meta'] = get_general_metadata(task), ['@timestamp'] = os.time(os.date("*t")).."000"}
   table.insert(rows, row)
   nrows = nrows + 1
   if nrows > settings['limit'] then
