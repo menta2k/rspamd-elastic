@@ -92,10 +92,13 @@ local function get_general_metadata(task)
         r.ip = origin
     end
   end
+  r.direction = "Inbound"
   r.user = task:get_user() or 'unknown'
   r.qid = task:get_queue_id() or 'unknown'
   r.action = task:get_metric_action('default')
-
+  if r.user != 'unknown' then
+      r.direction = "Outbound"
+  end
   local s = task:get_metric_score('default')[1]
   r.score =  s
 
