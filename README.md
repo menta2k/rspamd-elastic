@@ -12,5 +12,3 @@ Metadata collector for rspamd using elasticsearch backend
 
 ## Todo
  - Better error handling. Make a strategy what to do if elasticsearch fails to create document or index
- - Import predefined dashboard and visualizations into kibana index.
- - Some optimizations on mapping template
