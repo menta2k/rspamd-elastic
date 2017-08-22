@@ -13,13 +13,13 @@ redis_params = rspamd_parse_redis_server('elastic')
 
 local rows = {}
 local nrows = 0
-local json_mappings
+local elastic_template
 local redis_params
 local settings = {
   limit = 10,
   index_pattern = 'rspamd-%Y.%m.%d',
   server = 'localhost:9200',
-  mapping_file = '/etc/rspamd/rspamd_template.json',
+  template_file = '/etc/rspamd/rspamd_template.json',
   kibana_file = '/etc/rspamd/kibana.json',
   key_prefix = 'elastic-',
   expire = 3600,
@@ -148,6 +148,7 @@ local function get_general_metadata(task)
 end
 
 local function elastic_collect(task)
+  if not enabled then return end
   if rspamd_lua_utils.is_rspamc_or_controller(task) then return end
   local row = {['rspam_meta'] = get_general_metadata(task), ['@timestamp'] = os.time(os.date("*t")).."000"}
   table.insert(rows, row)
@@ -218,7 +219,7 @@ local function check_elastic_server(ev_base)
       rspamd_http.request({
         url = 'http://'..settings['server']..'/_template/rspamd',
         task = task,
-        body = json_mappings,
+        body = elastic_template,
         method = 'put',
         callback = http_template_create_callback
       })
@@ -231,6 +232,65 @@ local function check_elastic_server(ev_base)
     callback = http_template_exist_callback
   })
 end
+-- import ingest pipeline and kibana dashboard/visualization
+local function initial_setup(worker)
+  if not (worker:get_name() == 'normal' and worker:get_index() == 0) then return end
+  if enabled then
+    -- create ingest pipeline
+    rspamd_http.request({
+      url = 'http://'..settings['server']..'/_ingest/pipeline/rspamd-geoip',
+      task = task,
+      body = '{"description" : "Add geoip info for rspamd","processors" : [{"geoip" : {"field" : "rspam_meta.ip","target_field": "rspam_meta.geoip"}}]}',
+      method = 'put',
+    })
+    -- create template mappings if not exist
+    local function http_template_exist_callback(err, code, body, headers)
+      if code ~= 200 or err_message then
+        rspamd_http.request({
+          url = 'http://'..settings['server']..'/_template/rspamd',
+          task = task,
+          body = elastic_template,
+          method = 'put',
+        })
+      end
+    end
+    rspamd_http.request({
+      url = 'http://'..settings['server']..'/_template/rspamd',
+      task = task,
+      method = 'head',
+      callback = http_template_exist_callback
+    })
+    -- add kibana dashboard and visualizations
+    local kibana_mappings = read_file(settings['kibana_file']);
+    if enabled and settings['import_kibana'] then
+        local kibana_mappings = read_file(settings['kibana_file']);
+        if kibana_mappings then
+          local parser = ucl.parser()
+          local res,err = parser:parse_string(kibana_mappings)
+          if not res then
+            return
+          end
+          local obj = parser:get_object()
+          local bulk_json = ""
+          for _,item in ipairs(obj) do
+            bulk_json = bulk_json..'{ "index" : { "_index" : ".kibana", "_type" : "'..item["_type"]..'" ,"_id": "'..item["_id"]..'"} }'.."\n"
+            bulk_json = bulk_json..ucl.to_format(item['_source'], 'json-compact').."\n"
+          end
+          rspamd_http.request({
+            url = 'http://'..settings['server']..'/.kibana/_bulk',
+            headers = {
+              ['Content-Type'] = 'application/x-ndjson',
+            },
+            body = bulk_json,
+            task = task,
+            method = 'post'
+          })
+        else
+          rspamd_logger.infox(rspamd_config, 'kibana templatefile not found')
+        end
+    end
+  end
+end
 rspamd_config:add_on_load(function(cfg, ev_base,worker)
   if opts then
       for k,v in pairs(opts) do
@@ -241,46 +301,21 @@ rspamd_config:add_on_load(function(cfg, ev_base,worker)
         enabled = false
         return
       end
-      if not settings['mapping_file'] then
-          rspamd_logger.infox(rspamd_config, 'elastic mapping_file is required, disabling module')
+      if not settings['template_file'] then
+          rspamd_logger.infox(rspamd_config, 'elastic template_file is required, disabling module')
           enabled = false
           return
       end
   end
-  json_mappings = read_file(settings['mapping_file']);
-  if not json_mappings then
+  elastic_template = read_file(settings['template_file']);
+  if not elastic_template then
         rspamd_logger.infox(rspamd_config, 'elastic unable to read mappings, disabling module')
         enabled = false
         return
   end
   redis_params = rspamd_parse_redis_server('elastic')
-  if not (worker:get_name() == 'normal' and worker:get_index() == 0) then return end
-  check_elastic_server(ev_base)
-  if enabled and settings['import_kibana'] then
-      local kibana_mappings = read_file(settings['kibana_file']);
-      if kibana_mappings then
-        local parser = ucl.parser()
-        local res,err = parser:parse_string(kibana_mappings)
-        if not res then
-          return
-        end
-        local obj = parser:get_object()
-        local bulk_json = ""
-        for _,item in ipairs(obj) do
-          bulk_json = bulk_json..'{ "index" : { "_index" : ".kibana", "_type" : "'..item["_type"]..'" ,"_id": "'..item["_id"]..'"} }'.."\n"
-          bulk_json = bulk_json..ucl.to_format(item['_source'], 'json-compact').."\n"
-        end
-        rspamd_http.request({
-          url = 'http://'..settings['server']..'/.kibana/_bulk',
-          headers = {
-            ['Content-Type'] = 'application/x-ndjson',
-          },
-          body = bulk_json,
-          task = task,
-          method = 'post'
-        })
-      end
-  end
+  check_elastic_server(ev_base) -- check for elasticsearch requirements
+  initial_setup(worker) -- import mappings pipeline and visualizations
 end)
 
 if enabled == true then
